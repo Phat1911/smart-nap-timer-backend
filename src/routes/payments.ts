@@ -12,6 +12,14 @@ const orders = new Map<number, {
   status:  'pending' | 'paid' | 'cancelled';
 }>();
 
+// ── In-memory tier store ────────────────────────────────────────────────────
+// userId -> granted tier
+// ⚠️  IMPORTANT: This Map resets every time the server restarts.
+// On Render free tier this happens after ~15 min of inactivity.
+// Before production, replace this with a persistent database (e.g. Postgres,
+// Redis, or Render's managed DB) so granted tiers survive restarts.
+const userTiers = new Map<string, 'pro' | 'max'>();
+
 // ── POST /payments/create ──────────────────────────────────────────────────────
 // Body: { tier: 'pro' | 'max', userId: string }
 // Returns: { checkoutUrl: string, orderCode: number }
@@ -91,7 +99,9 @@ router.post('/webhook', async (req: Request, res: Response) => {
     if (order && order.status === 'pending') {
       order.status = 'paid';
       orders.set(orderCode, order);
-      console.log(`[webhook] Order ${orderCode} paid -- tier: ${order.tier}, user: ${order.userId}`);
+      // Grant tier to user -- this is the ONLY place tier is ever granted
+      userTiers.set(order.userId, order.tier);
+      console.log(`[webhook] Tier granted: ${order.userId} -> ${order.tier}`);
     }
 
     return res.status(200).json({ success: true });
@@ -100,6 +110,20 @@ router.post('/webhook', async (req: Request, res: Response) => {
     console.warn('[webhook] signature error (may be PayOS health check):', err?.message);
     return res.status(200).json({ received: false, error: 'invalid_signature' });
   }
+});
+
+// ── GET /me/tier ─────────────────────────────────────────────────────────────
+// App calls this to read the authoritative tier from the server.
+// This is the ONLY source of truth for tier status.
+// Query: ?userId=<deviceId>
+// Returns: { tier: 'free' | 'pro' | 'max' }
+router.get('/me/tier', (req: Request, res: Response) => {
+  const userId = req.query.userId as string;
+  if (!userId || typeof userId !== 'string' || userId.trim() === '') {
+    return res.status(400).json({ error: 'userId query param is required.' });
+  }
+  const tier = userTiers.get(userId.trim()) ?? 'free';
+  return res.json({ tier });
 });
 
 export default router;
