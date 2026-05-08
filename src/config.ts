@@ -22,6 +22,6 @@ export const config = {
 
 // Tier pricing in VND
 export const TIER_VND_PRICE: Record<'pro' | 'max', number> = {
-  pro: 79000,
-  max: 169000,
+  pro: 59000,
+  max: 109000,
 };

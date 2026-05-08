@@ -1,26 +1,85 @@
 import { Router, Request, Response } from 'express';
+import * as fs from 'fs';
+import * as path from 'path';
 import { getPayOS } from '../payos';
 import { config, TIER_VND_PRICE } from '../config';
 
 const router = Router();
 
-// In-memory order store (resets on server restart -- fine for MVP)
-// Maps orderCode -> { tier, userId, status }
+// ── Subscription persistence ──────────────────────────────────────────────────
+// Stored in a JSON file so tier grants survive server restarts.
+// On Render free tier, the filesystem persists between restarts (not deployments).
+
+const DATA_DIR  = path.resolve(process.cwd(), 'data');
+const DATA_FILE = path.join(DATA_DIR, 'subscriptions.json');
+
+interface SubscriptionRecord {
+  tier:       'pro' | 'max';
+  grantedAt:  string;   // ISO date
+  expiresAt:  string;   // ISO date — grantedAt + 30 days
+}
+
+// userId -> SubscriptionRecord
+type SubscriptionStore = Record<string, SubscriptionRecord>;
+
+function loadSubscriptions(): SubscriptionStore {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (!fs.existsSync(DATA_FILE)) return {};
+    const raw = fs.readFileSync(DATA_FILE, 'utf8');
+    return JSON.parse(raw) as SubscriptionStore;
+  } catch {
+    return {};
+  }
+}
+
+function saveSubscriptions(store: SubscriptionStore): void {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(DATA_FILE, JSON.stringify(store, null, 2), 'utf8');
+  } catch (e) {
+    console.error('[subscriptions] Failed to save:', e);
+  }
+}
+
+function getActiveTier(userId: string): 'free' | 'pro' | 'max' {
+  const store = loadSubscriptions();
+  const record = store[userId];
+  if (!record) return 'free';
+  if (new Date(record.expiresAt) <= new Date()) {
+    // Expired — clean up and return free
+    delete store[userId];
+    saveSubscriptions(store);
+    return 'free';
+  }
+  return record.tier;
+}
+
+function grantTier(userId: string, tier: 'pro' | 'max'): void {
+  const store = loadSubscriptions();
+  const now = new Date();
+  const expiresAt = new Date(now);
+  expiresAt.setDate(expiresAt.getDate() + 30);   // 30-day subscription
+
+  store[userId] = {
+    tier,
+    grantedAt: now.toISOString(),
+    expiresAt: expiresAt.toISOString(),
+  };
+  saveSubscriptions(store);
+  console.log(`[subscriptions] Granted ${tier} to ${userId}, expires ${expiresAt.toISOString()}`);
+}
+
+// ── In-memory order store ─────────────────────────────────────────────────────
+// Orders only need to live long enough to be confirmed (minutes), so in-memory
+// is fine here. Subscriptions are what must survive restarts — handled above.
 const orders = new Map<number, {
   tier:    'pro' | 'max';
   userId:  string;
   status:  'pending' | 'paid' | 'cancelled';
 }>();
 
-// ── In-memory tier store ────────────────────────────────────────────────────
-// userId -> granted tier
-// ⚠️  IMPORTANT: This Map resets every time the server restarts.
-// On Render free tier this happens after ~15 min of inactivity.
-// Before production, replace this with a persistent database (e.g. Postgres,
-// Redis, or Render's managed DB) so granted tiers survive restarts.
-const userTiers = new Map<string, 'pro' | 'max'>();
-
-// ── POST /payments/create ──────────────────────────────────────────────────────
+// ── POST /payments/create ─────────────────────────────────────────────────────
 // Body: { tier: 'pro' | 'max', userId: string }
 // Returns: { checkoutUrl: string, orderCode: number }
 router.post('/create', async (req: Request, res: Response) => {
@@ -53,23 +112,17 @@ router.post('/create', async (req: Request, res: Response) => {
       }],
     });
 
-    // Store order
     orders.set(orderCode, { tier, userId, status: 'pending' });
 
-    return res.json({
-      checkoutUrl: link.checkoutUrl,
-      orderCode,
-      amount,
-      tier,
-    });
+    return res.json({ checkoutUrl: link.checkoutUrl, orderCode, amount, tier });
   } catch (err: any) {
     console.error('[payments/create]', err?.message ?? err);
     return res.status(500).json({ error: 'Failed to create payment link.' });
   }
 });
 
-// ── GET /payments/status/:orderCode ───────────────────────────────────────────
-// App polls this after user returns from PayOS checkout
+// ── GET /payments/status/:orderCode ──────────────────────────────────────────
+// App polls this after user returns from PayOS checkout.
 // Returns: { status: 'pending' | 'paid' | 'cancelled', tier?: string }
 router.get('/status/:orderCode', (req: Request, res: Response) => {
   const orderCode = parseInt(req.params.orderCode, 10);
@@ -85,9 +138,9 @@ router.get('/status/:orderCode', (req: Request, res: Response) => {
   });
 });
 
-// ── POST /payments/webhook ─────────────────────────────────────────────────────
-// PayOS calls this when a payment is confirmed
-// IMPORTANT: always return 200 even on signature error (PayOS health check requirement)
+// ── POST /payments/webhook ────────────────────────────────────────────────────
+// PayOS calls this when a payment is confirmed.
+// IMPORTANT: always return 200 even on signature error (PayOS health check requirement).
 router.post('/webhook', async (req: Request, res: Response) => {
   try {
     const payos = getPayOS();
@@ -99,31 +152,39 @@ router.post('/webhook', async (req: Request, res: Response) => {
     if (order && order.status === 'pending') {
       order.status = 'paid';
       orders.set(orderCode, order);
-      // Grant tier to user -- this is the ONLY place tier is ever granted
-      userTiers.set(order.userId, order.tier);
-      console.log(`[webhook] Tier granted: ${order.userId} -> ${order.tier}`);
+      // Grant a 30-day subscription — persisted to disk
+      grantTier(order.userId, order.tier);
     }
 
     return res.status(200).json({ success: true });
   } catch (err: any) {
-    // Return 200 even on bad signature -- PayOS tests with invalid signatures
     console.warn('[webhook] signature error (may be PayOS health check):', err?.message);
     return res.status(200).json({ received: false, error: 'invalid_signature' });
   }
 });
 
-// ── GET /me/tier ─────────────────────────────────────────────────────────────
+// ── GET /payments/me/tier ─────────────────────────────────────────────────────
 // App calls this to read the authoritative tier from the server.
-// This is the ONLY source of truth for tier status.
+// Automatically returns 'free' if the 30-day subscription has expired.
 // Query: ?userId=<deviceId>
-// Returns: { tier: 'free' | 'pro' | 'max' }
+// Returns: { tier: 'free' | 'pro' | 'max', expiresAt?: string }
 router.get('/me/tier', (req: Request, res: Response) => {
   const userId = req.query.userId as string;
   if (!userId || typeof userId !== 'string' || userId.trim() === '') {
     return res.status(400).json({ error: 'userId query param is required.' });
   }
-  const tier = userTiers.get(userId.trim()) ?? 'free';
-  return res.json({ tier });
+
+  const uid   = userId.trim();
+  const tier  = getActiveTier(uid);
+
+  // Include expiresAt in the response so the app can show it to the user
+  const store  = loadSubscriptions();
+  const record = store[uid];
+
+  return res.json({
+    tier,
+    expiresAt: record ? record.expiresAt : null,
+  });
 });
 
 export default router;
